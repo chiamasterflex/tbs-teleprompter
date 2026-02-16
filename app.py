@@ -45,18 +45,18 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
-# --- 1. CONFIGURATION ---
-ALIYUN_AK_ID = "LTAI5tJKHDFcaiEGrCDdtAJy"
-ALIYUN_AK_SECRET = "8ca7iMVmV9iQYg8QGlxLTWajlg7yCy"
+# --- 1. CONFIGURATION (SECURE SECRETS VAULT) ---
+ALIYUN_AK_ID = st.secrets["ALIYUN_AK_ID"]
+ALIYUN_AK_SECRET = st.secrets["ALIYUN_AK_SECRET"]
 
-# DIALECT APPKEYS
-ALIYUN_APPKEY_MANDARIN = "kNPPGUGiUNqBa7DB" 
-ALIYUN_APPKEY_CANTONESE = "B63clvkhBpyeehDk" 
+ALIYUN_APPKEY_MANDARIN = st.secrets["ALIYUN_APPKEY_MANDARIN"]
+ALIYUN_APPKEY_CANTONESE = st.secrets["ALIYUN_APPKEY_CANTONESE"]
 
+DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
+
+# Hardcoded Non-Secret Variables
 ALIYUN_VOCAB_ID = "" 
 ALIYUN_CUSTOM_MODEL_ID = "d6e3d70e9230455384e225521adcc1f6"
-
-DEEPSEEK_API_KEY = "sk-43a90c6020b44e818013a112dd890b79" 
 DB_PATH = "tbs_knowledge_db"
 
 deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
@@ -250,7 +250,7 @@ def start_websocket_stream(state, webrtc_ctx, t_queue, selected_appkey):
         try: sr.stop()
         except: pass
 
-# --- 6. ADMIN SIDEBAR (Hidden by default on mobile) ---
+# --- 6. ADMIN SIDEBAR ---
 st.sidebar.header("📚 Admin: Brain Setup")
 st.sidebar.caption("Upload TBS teachings here to expand the translation database.")
 if state['vector_store'] is not None:
@@ -281,10 +281,8 @@ if st.sidebar.button("🗑️ Reset Database"):
 # --- 7. MAIN UI (MOBILE OPTIMIZED) ---
 st.title("🪷 TBS Pro Translator")
 
-# Control Dashboard at the top
 st.info(f"**Status:** {state['status']} | **Latency:** {state['last_latency']}s | **Queue:** {state['pending_count']}")
 
-# User Controls
 col_lang, col_mic = st.columns([1, 1])
 with col_lang:
     state['dialect'] = st.selectbox("Speech Language:", ["Mandarin", "Cantonese"])
@@ -303,7 +301,6 @@ with col_mic:
         },
     )
 
-# Logic to map WebRTC state to the Alibaba Thread
 if webrtc_ctx.state.playing and not state['run']:
     state['run'] = True
     threading.Thread(target=start_websocket_stream, args=(state, webrtc_ctx, st.session_state['translation_queue'], active_appkey), daemon=True).start()
@@ -315,7 +312,6 @@ elif not webrtc_ctx.state.playing and state['run']:
 
 st.divider()
 
-# Scrolling Display Areas
 def build_scroll_html(key_type):
     html = "<div class='scroll-container'>"
     if state[f'live_{key_type}']:
@@ -326,7 +322,6 @@ def build_scroll_html(key_type):
         html += f"<div class='committed-{key_type}'>{item[key_type]}{lat}</div><hr class='sep'>"
     return html + "</div>"
 
-# On Desktop these render side-by-side. On Mobile, Streamlit auto-stacks them vertically.
 c1, c2 = st.columns(2)
 with c1: 
     st.markdown("<div class='panel-header'>🇨🇳 Chinese Input</div>", unsafe_allow_html=True)
