@@ -7,7 +7,6 @@ import os
 import tempfile
 import shutil
 import json
-import traceback
 
 # --- WEB AUDIO LIBRARIES ---
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
@@ -25,11 +24,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
-# --- 1. CONFIGURATION ---
+# --- 1. CONFIGURATION (VAULT ACCESS) ---
 ALIYUN_AK_ID = st.secrets["ALIYUN_AK_ID"]
 ALIYUN_AK_SECRET = st.secrets["ALIYUN_AK_SECRET"]
 DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 
+# These remain hardcoded as they aren't security risks
 ALIYUN_APPKEY_MANDARIN = "kNPPGUGiUNqBa7DB"
 ALIYUN_APPKEY_CANTONESE = "B63clvkhBpyeehDk"
 
@@ -49,7 +49,7 @@ st.markdown("""
     .live-en { font-size: 19px; color: #E65100; font-weight: 600; line-height: 1.6; font-style: italic; }
     .sep { border: 0; border-top: 1px solid #f0f2f6; margin: 15px 0; }
     .panel-header { font-size: 13px; font-weight: 600; text-transform: uppercase; color: #757575; margin-bottom: 5px; }
-    .latency-tag { font-size: 12px; color: #888; font-style: italic; margin-left: 8px; }
+    .cta-text { font-size: 24px; font-weight: 600; color: #1E88E5; text-align: center; margin-bottom: -10px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -74,20 +74,22 @@ def generate_dynamic_prompt(chinese_text, vector_store):
     prompt = "You are the official TBS translator. Rules: 1. 100% English. 2. Terms: 蓮生活佛=Living Buddha Lian-sheng, 師尊=Grand Master. Output ONLY translation."
     if vector_store:
         try:
+            # RAG Search: Retrieve top 2 matches from the DB folder
             docs = vector_store.similarity_search(chinese_text, k=2)
             if docs:
                 prompt += "\nRef: " + " ".join([d.page_content for d in docs])
         except: pass
     return prompt
 
-# --- 4. STATE & WORKER ---
+# --- 4. STATE & STREAMING WORKER ---
 if 'app_state' not in st.session_state:
     st.session_state['app_state'] = {
         'history': [], 'live_cn': "", 'live_en': "", 'run': False,
-        'vector_store': None, 'status': "Idle", 'dialect': "Mandarin", 'last_latency': 0
+        'vector_store': None, 'status': "Idle", 'dialect': "Mandarin"
     }
 state = st.session_state['app_state']
 
+# Auto-load RAG from GitHub folder on startup
 if state['vector_store'] is None and os.path.exists(DB_PATH):
     try:
         state['vector_store'] = FAISS.load_local(DB_PATH, get_embedding_model(), allow_dangerous_deserialization=True)
@@ -100,7 +102,6 @@ if 'trans_queue' not in st.session_state:
             item = q.get()
             if item is None: break
             text, is_final, v_store = item
-            start_t = time.time()
             try:
                 prompt = generate_dynamic_prompt(text, v_store)
                 response = deepseek_client.chat.completions.create(
@@ -116,9 +117,7 @@ if 'trans_queue' not in st.session_state:
                         if not is_final: app_state['live_en'] = full_res + "..."
                 if is_final:
                     clean_res = re.sub(r'[\u4e00-\u9fff]+', '', full_res).strip()
-                    latency = round(time.time() - start_t, 2)
-                    app_state['last_latency'] = latency
-                    app_state['history'].append({"cn": text, "en": clean_res, "lat": latency})
+                    app_state['history'].append({"cn": text, "en": clean_res})
                     app_state['live_en'] = ""
             except: pass
             finally: q.task_done()
@@ -153,16 +152,16 @@ def start_aliyun(state, webrtc_ctx, q, appkey):
 
 # --- 6. SIDEBAR ---
 with st.sidebar:
-    st.header("⚙️ Settings")
-    state['dialect'] = st.selectbox("Dialect:", ["Mandarin", "Cantonese"])
+    st.header("⚙️ Configuration")
+    state['dialect'] = st.selectbox("Speech Dialect:", ["Mandarin", "Cantonese"])
     st.divider()
-    if st.button("🧹 Clear History"):
+    if st.button("🧹 Clear Conversation"):
         state['history'] = []
         st.rerun()
     st.divider()
-    st.subheader("🧠 Brain")
-    uploaded_files = st.file_uploader("Add Context", type=['pdf', 'txt', 'csv'], accept_multiple_files=True)
-    if st.button("➕ Train"):
+    st.subheader("🧠 Brain Setup")
+    uploaded_files = st.file_uploader("Upload Knowledge", type=['pdf', 'txt', 'csv'], accept_multiple_files=True)
+    if st.button("➕ Expand Brain"):
         if uploaded_files:
             with st.spinner("Learning..."):
                 docs = []
@@ -179,16 +178,17 @@ with st.sidebar:
 # --- 7. MAIN UI ---
 st.title("🪷 TBS Pro Translator")
 
+st.markdown("<div class='cta-text'>Ready to Translate?</div>", unsafe_allow_html=True)
 active_key = ALIYUN_APPKEY_MANDARIN if state['dialect'] == "Mandarin" else ALIYUN_APPKEY_CANTONESE
 webrtc_ctx = webrtc_streamer(
-    key="asr", mode=WebRtcMode.SENDONLY, 
+    key="asr", 
+    mode=WebRtcMode.SENDONLY, 
     rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
     media_stream_constraints={"video": False, "audio": True}
 )
 
-# RESTORED STATUS AND LATENCY BAR
-brain_status = f"🧠 {state['vector_store'].index.ntotal} items" if state['vector_store'] else "🧠 Empty"
-st.caption(f"**Status:** {state['status']} | **Mode:** {state['dialect']} | **Latency:** {state['last_latency']}s | **{brain_status}**")
+brain_label = f"🧠 Brain: {state['vector_store'].index.ntotal} items" if state['vector_store'] else "🧠 Brain: Empty"
+st.caption(f"Status: {state['status']} | Mode: {state['dialect']} | {brain_label}")
 
 if webrtc_ctx.state.playing and not state['run']:
     state['run'] = True
@@ -204,16 +204,15 @@ def get_html(k):
     html = f"<div class='scroll-container'>"
     if state[f'live_{k}']: html += f"<div class='live-{k}'>{state[f'live_{k}']}</div>"
     for i in reversed(state['history']):
-        lat_txt = f"<span class='latency-tag'>({i['lat']}s)</span>" if k == 'en' else ""
-        html += f"<div class='committed-{k}'>{i[k]}{lat_txt}</div><hr class='sep'>"
+        html += f"<div class='committed-{k}'>{i[k]}</div><hr class='sep'>"
     return html + "</div>"
 
 c1, c2 = st.columns(2)
 with c1: 
-    st.markdown("<div class='panel-header'>Chinese Listening</div>", 1)
-    st.markdown(get_html("cn"), 1)
+    st.markdown("<div class='panel-header'>Chinese Listening</div>", unsafe_allow_html=True)
+    st.markdown(get_html("cn"), unsafe_allow_html=True)
 with c2: 
-    st.markdown("<div class='panel-header'>English Thinking</div>", 1)
-    st.markdown(get_html("en"), 1)
+    st.markdown("<div class='panel-header'>English Thinking</div>", unsafe_allow_html=True)
+    st.markdown(get_html("en"), unsafe_allow_html=True)
 
 if state['run']: time.sleep(0.4); st.rerun()
