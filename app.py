@@ -7,6 +7,7 @@ import os
 import tempfile
 import shutil
 import json
+import traceback
 
 # --- WEB AUDIO LIBRARIES ---
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
@@ -24,19 +25,19 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
-# --- 1. CONFIGURATION (VAULT ACCESS) ---
+# --- 1. CONFIGURATION ---
 ALIYUN_AK_ID = st.secrets["ALIYUN_AK_ID"]
 ALIYUN_AK_SECRET = st.secrets["ALIYUN_AK_SECRET"]
 DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 
-# These remain hardcoded as they aren't security risks
 ALIYUN_APPKEY_MANDARIN = "kNPPGUGiUNqBa7DB"
 ALIYUN_APPKEY_CANTONESE = "B63clvkhBpyeehDk"
 
 DB_PATH = "tbs_knowledge_db"
 deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-st.set_page_config(page_title="TBS Pro Teleprompter", layout="wide", initial_sidebar_state="collapsed")
+# Resetting sidebar to 'expanded' so it's easy to find
+st.set_page_config(page_title="TBS Pro Teleprompter", layout="wide", initial_sidebar_state="expanded")
 
 # --- 2. CSS STYLING ---
 st.markdown("""
@@ -49,7 +50,6 @@ st.markdown("""
     .live-en { font-size: 19px; color: #E65100; font-weight: 600; line-height: 1.6; font-style: italic; }
     .sep { border: 0; border-top: 1px solid #f0f2f6; margin: 15px 0; }
     .panel-header { font-size: 13px; font-weight: 600; text-transform: uppercase; color: #757575; margin-bottom: 5px; }
-    .cta-text { font-size: 24px; font-weight: 600; color: #1E88E5; text-align: center; margin-bottom: -10px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -74,14 +74,13 @@ def generate_dynamic_prompt(chinese_text, vector_store):
     prompt = "You are the official TBS translator. Rules: 1. 100% English. 2. Terms: 蓮生活佛=Living Buddha Lian-sheng, 師尊=Grand Master. Output ONLY translation."
     if vector_store:
         try:
-            # RAG Search: Retrieve top 2 matches from the DB folder
             docs = vector_store.similarity_search(chinese_text, k=2)
             if docs:
                 prompt += "\nRef: " + " ".join([d.page_content for d in docs])
         except: pass
     return prompt
 
-# --- 4. STATE & STREAMING WORKER ---
+# --- 4. STATE & WORKER ---
 if 'app_state' not in st.session_state:
     st.session_state['app_state'] = {
         'history': [], 'live_cn': "", 'live_en': "", 'run': False,
@@ -89,7 +88,6 @@ if 'app_state' not in st.session_state:
     }
 state = st.session_state['app_state']
 
-# Auto-load RAG from GitHub folder on startup
 if state['vector_store'] is None and os.path.exists(DB_PATH):
     try:
         state['vector_store'] = FAISS.load_local(DB_PATH, get_embedding_model(), allow_dangerous_deserialization=True)
@@ -150,17 +148,16 @@ def start_aliyun(state, webrtc_ctx, q, appkey):
             except: pass
     sr.stop()
 
-# --- 6. SIDEBAR ---
+# --- 6. SIDEBAR CONTROLS ---
 with st.sidebar:
-    st.header("⚙️ Configuration")
-    state['dialect'] = st.selectbox("Speech Dialect:", ["Mandarin", "Cantonese"])
-    st.divider()
-    if st.button("🧹 Clear Conversation"):
+    st.header("⚙️ Admin Controls")
+    if st.button("🧹 Clear History"):
         state['history'] = []
         st.rerun()
+    
     st.divider()
     st.subheader("🧠 Brain Setup")
-    uploaded_files = st.file_uploader("Upload Knowledge", type=['pdf', 'txt', 'csv'], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Upload Teachings", type=['pdf', 'txt', 'csv'], accept_multiple_files=True)
     if st.button("➕ Expand Brain"):
         if uploaded_files:
             with st.spinner("Learning..."):
@@ -176,19 +173,18 @@ with st.sidebar:
                 state['vector_store'].save_local(DB_PATH); st.rerun()
 
 # --- 7. MAIN UI ---
-st.title("🪷 TBS Pro Translator")
+st.title("🪷 TBS Live Translator")
+brain_status = f"🧠 Brain: {state['vector_store'].index.ntotal} fragments" if state['vector_store'] else "🧠 Brain: Empty"
+st.info(f"**Status:** {state['status']} | **{brain_status}**")
 
-st.markdown("<div class='cta-text'>Ready to Translate?</div>", unsafe_allow_html=True)
-active_key = ALIYUN_APPKEY_MANDARIN if state['dialect'] == "Mandarin" else ALIYUN_APPKEY_CANTONESE
-webrtc_ctx = webrtc_streamer(
-    key="asr", 
-    mode=WebRtcMode.SENDONLY, 
-    rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
-    media_stream_constraints={"video": False, "audio": True}
-)
-
-brain_label = f"🧠 Brain: {state['vector_store'].index.ntotal} items" if state['vector_store'] else "🧠 Brain: Empty"
-st.caption(f"Status: {state['status']} | Mode: {state['dialect']} | {brain_label}")
+col_lang, col_mic = st.columns(2)
+with col_lang:
+    state['dialect'] = st.selectbox("Select Dialect:", ["Mandarin", "Cantonese"])
+    active_key = ALIYUN_APPKEY_MANDARIN if state['dialect'] == "Mandarin" else ALIYUN_APPKEY_CANTONESE
+with col_mic:
+    webrtc_ctx = webrtc_streamer(key="asr", mode=WebRtcMode.SENDONLY, 
+                                 rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
+                                 media_stream_constraints={"video": False, "audio": True})
 
 if webrtc_ctx.state.playing and not state['run']:
     state['run'] = True
@@ -197,8 +193,6 @@ if webrtc_ctx.state.playing and not state['run']:
 elif not webrtc_ctx.state.playing and state['run']:
     state['run'] = False
     st.rerun()
-
-st.divider()
 
 def get_html(k):
     html = f"<div class='scroll-container'>"
