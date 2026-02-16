@@ -1,5 +1,6 @@
 numpy
 sentence-transformers
+torch
 streamlit
 streamlit-webrtc
 av
