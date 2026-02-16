@@ -35,20 +35,42 @@ ALIYUN_APPKEY_CANTONESE = "B63clvkhBpyeehDk"
 DB_PATH = "tbs_knowledge_db"
 deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-st.set_page_config(page_title="TBS Pro Teleprompter", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="TBS Pro Translator", layout="wide", initial_sidebar_state="collapsed")
 
-# --- 2. CSS STYLING ---
+# --- 2. GOOGLE TRANSLATE STYLE CSS ---
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;500;600&display=swap');
-    html, body, [class*="css"]  { font-family: 'Open Sans', sans-serif !important; }
-    .scroll-container { display: flex; flex-direction: column-reverse; height: 45vh; min-height: 350px; overflow-y: auto; border: 1px solid #e0e0e0; border-radius: 8px; padding: 20px; background-color: #ffffff; margin-bottom: 20px; }
-    .committed-cn, .committed-en { font-size: 19px; color: #31333F; line-height: 1.6; font-weight: 400; }
-    .live-cn { font-size: 19px; color: #1565C0; font-weight: 600; line-height: 1.6; }
-    .live-en { font-size: 19px; color: #E65100; font-weight: 600; line-height: 1.6; font-style: italic; }
-    .sep { border: 0; border-top: 1px solid #f0f2f6; margin: 15px 0; }
-    .panel-header { font-size: 13px; font-weight: 600; text-transform: uppercase; color: #757575; margin-bottom: 5px; }
-    .latency-tag { font-size: 12px; color: #888; font-style: italic; margin-left: 8px; }
+    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap');
+    html, body, [class*="css"]  { font-family: 'Roboto', sans-serif !important; }
+    
+    .main-card {
+        background-color: #f8f9fa;
+        border: 1px solid #dadce0;
+        border-radius: 8px;
+        padding: 20px;
+        min-height: 400px;
+        height: 55vh;
+        overflow-y: auto;
+    }
+    
+    .text-entry {
+        padding: 15px;
+        border-bottom: 1px solid #e8eaed;
+        display: flex;
+        flex-direction: column;
+    }
+    
+    .source-text { font-size: 20px; color: #3c4043; line-height: 1.5; }
+    .target-text { font-size: 20px; color: #1a73e8; line-height: 1.5; font-weight: 500; }
+    .live-target { color: #e67e22; font-style: italic; }
+    
+    .panel-header {
+        font-size: 13px;
+        font-weight: 500;
+        color: #70757a;
+        text-transform: uppercase;
+        margin-bottom: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -107,15 +129,12 @@ if 'trans_queue' not in st.session_state:
                     messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
                     stream=True, temperature=0.1
                 )
-                
                 temp_full_res = ""
                 for chunk in response:
                     content = chunk.choices[0].delta.content
                     if content:
                         temp_full_res += content
-                        if not is_final:
-                            app_state['live_en'] = temp_full_res
-                
+                        if not is_final: app_state['live_en'] = temp_full_res
                 if is_final:
                     clean_res = re.sub(r'[\u4e00-\u9fff]+', '', temp_full_res).strip()
                     latency = round(time.time() - start_t, 2)
@@ -133,84 +152,58 @@ def start_aliyun(state, webrtc_ctx, q, appkey):
     def on_result_changed(message, *args):
         text = json.loads(message)['payload']['result']
         state['live_cn'] = text
-        # Throttled live update to keep English stable and prevent queue buildup
-        if len(text) > 10 and len(text) % 8 == 0: 
-            q.put((text, False, state['vector_store']))
-
+        if len(text) > 10 and len(text) % 8 == 0: q.put((text, False, state['vector_store']))
     def on_sentence_end(message, *args):
         text = json.loads(message)['payload']['result']
         clean_text = re.sub(r'[^\w\u4e00-\u9fff\s]', '', text).strip()
-        if len(clean_text) >= 2:
-            q.put((clean_text, True, state['vector_store']))
+        if len(clean_text) >= 2: q.put((clean_text, True, state['vector_store']))
         state['live_cn'] = ""
-
     sr = nls.NlsSpeechTranscriber(url="wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1",
                                   token=token, appkey=appkey,
                                   on_result_changed=on_result_changed, on_sentence_end=on_sentence_end)
     resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
     sr.start(aformat="pcm", ex={"enable_intermediate_result": True, "enable_punctuation_prediction": True})
-    
     while state['run'] and webrtc_ctx.state.playing:
         if webrtc_ctx.audio_receiver:
             try:
-                # Optimized audio frame pulling
                 frames = webrtc_ctx.audio_receiver.get_frames(timeout=0.1)
                 for frame in frames:
-                    resampled_frames = resampler.resample(frame)
-                    for r_frame in resampled_frames:
+                    for r_frame in resampler.resample(frame):
                         sr.send_audio(r_frame.to_ndarray().tobytes())
-            except queue.Empty:
-                pass
-            except:
-                break
-        else:
-            time.sleep(0.1)
+            except: break
     sr.stop()
 
 # --- 6. SIDEBAR ---
 with st.sidebar:
-    st.header("⚙️ Settings")
-    state['dialect'] = st.selectbox("Dialect:", ["Mandarin", "Cantonese"])
+    st.header("⌨️ Manual Input")
+    manual_input = st.text_area("Chinese Text:", placeholder="Paste and click translate...")
+    if st.button("Translate Now"):
+        if manual_input:
+            st.session_state['trans_queue'].put((manual_input, True, state['vector_store']))
+
     st.divider()
+    state['dialect'] = st.selectbox("Dialect:", ["Mandarin", "Cantonese"])
     if st.button("🧹 Clear History"):
         state['history'] = []
         state['last_latency'] = 0.0
         st.rerun()
-    st.divider()
-    st.subheader("🧠 Brain")
-    uploaded_files = st.file_uploader("Add Context", type=['pdf', 'txt', 'csv'], accept_multiple_files=True)
-    if st.button("➕ Train"):
-        if uploaded_files:
-            with st.spinner("Learning..."):
-                docs = []
-                for uf in uploaded_files:
-                    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                        tmp.write(uf.getvalue()); tmp_p = tmp.name
-                    loader = PyPDFLoader(tmp_p) if uf.name.endswith('.pdf') else TextLoader(tmp_p)
-                    docs.extend(loader.load()); os.remove(tmp_p)
-                chunks = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=50).split_documents(docs)
-                if state['vector_store'] is None: state['vector_store'] = FAISS.from_documents(chunks, get_embedding_model())
-                else: state['vector_store'].add_documents(chunks)
-                state['vector_store'].save_local(DB_PATH); st.rerun()
 
 # --- 7. MAIN UI ---
 st.title("🪷 TBS Pro Translator")
 
-active_key = ALIYUN_APPKEY_MANDARIN if state['dialect'] == "Mandarin" else ALIYUN_APPKEY_CANTONESE
 webrtc_ctx = webrtc_streamer(
-    key="asr", 
-    mode=WebRtcMode.SENDONLY, 
+    key="asr", mode=WebRtcMode.SENDONLY, 
     rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
     media_stream_constraints={"video": False, "audio": True},
-    async_processing=True, # Enable async to help with the queue
-    audio_receiver_size=1024 # Bumping the 'bucket' size from 4 to 1024
+    async_processing=True, audio_receiver_size=1024 
 )
 
 brain_count = state['vector_store'].index.ntotal if state['vector_store'] else 0
-st.caption(f"**Status:** {state['status']} | **Mode:** {state['dialect']} | **Latency:** {state['last_latency']}s | **🧠 Brain:** {brain_count} items")
+st.caption(f"Status: {state['status']} | Latency: {state['last_latency']}s | 🧠 Brain: {brain_count} items")
 
 if webrtc_ctx.state.playing and not state['run']:
     state['run'] = True
+    active_key = ALIYUN_APPKEY_MANDARIN if state['dialect'] == "Mandarin" else ALIYUN_APPKEY_CANTONESE
     threading.Thread(target=start_aliyun, args=(state, webrtc_ctx, st.session_state['trans_queue'], active_key), daemon=True).start()
     st.rerun()
 elif not webrtc_ctx.state.playing and state['run']:
@@ -219,21 +212,28 @@ elif not webrtc_ctx.state.playing and state['run']:
 
 st.divider()
 
-def get_html(k):
-    html = f"<div class='scroll-container'>"
-    if state[f'live_{k}']: 
-        html += f"<div class='live-{k}'>{state[f'live_{k}']}</div>"
-    for i in reversed(state['history']):
-        lat_txt = f"<span class='latency-tag'>({i['lat']}s)</span>" if k == 'en' else ""
-        html += f"<div class='committed-{k}'>{i[k]}{lat_txt}</div><hr class='sep'>"
-    return html + "</div>"
-
+# DISPLAY PANELS
 c1, c2 = st.columns(2)
-with c1: 
-    st.markdown("<div class='panel-header'>Chinese Listening</div>", 1)
-    st.markdown(get_html("cn"), 1)
-with c2: 
-    st.markdown("<div class='panel-header'>English Thinking</div>", 1)
-    st.markdown(get_html("en"), 1)
+
+with c1:
+    st.markdown("<div class='panel-header'>Chinese Source</div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        if state['live_cn']:
+            st.markdown(f"<div class='source-text'>{state['live_cn']}</div>", unsafe_allow_html=True)
+        for i in reversed(state['history']):
+            st.markdown(f"<div class='source-text'>{i['cn']}</div>", unsafe_allow_html=True)
+            st.divider()
+
+with c2:
+    st.markdown("<div class='panel-header'>English Translation</div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        if state['live_en']:
+            st.markdown(f"<div class='target-text live-target'>{state['live_en']}</div>", unsafe_allow_html=True)
+        for i in reversed(state['history']):
+            # Using st.code here provides a built-in COPY button on hover!
+            st.markdown(f"<div class='target-text'>{i['en']}</div>", unsafe_allow_html=True)
+            st.code(i['en'], language="text") # This is your Copy Icon solution
+            st.caption(f"Latency: {i['lat']}s")
+            st.divider()
 
 if state['run']: time.sleep(0.4); st.rerun()
