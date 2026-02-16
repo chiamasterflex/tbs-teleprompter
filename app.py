@@ -182,9 +182,14 @@ with col_lang:
     state['dialect'] = st.selectbox("Select Dialect:", ["Mandarin", "Cantonese"])
     active_key = ALIYUN_APPKEY_MANDARIN if state['dialect'] == "Mandarin" else ALIYUN_APPKEY_CANTONESE
 with col_mic:
-    webrtc_ctx = webrtc_streamer(key="asr", mode=WebRtcMode.SENDONLY, 
-                                 rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
-                                 media_stream_constraints={"video": False, "audio": True})
+    webrtc_ctx = webrtc_streamer(
+        key="asr", 
+        mode=WebRtcMode.SENDONLY, 
+        rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
+        media_stream_constraints={"video": False, "audio": True},
+        async_processing=True,
+        audio_receiver_size=1024
+    )
 
 if webrtc_ctx.state.playing and not state['run']:
     state['run'] = True
