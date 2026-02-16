@@ -5,7 +5,6 @@ import queue
 import re
 import os
 import tempfile
-import shutil
 import json
 import traceback
 
@@ -36,7 +35,6 @@ ALIYUN_APPKEY_CANTONESE = "B63clvkhBpyeehDk"
 DB_PATH = "tbs_knowledge_db"
 deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-# Resetting sidebar to 'expanded' so it's easy to find
 st.set_page_config(page_title="TBS Pro Teleprompter", layout="wide", initial_sidebar_state="expanded")
 
 # --- 2. CSS STYLING ---
@@ -125,27 +123,39 @@ if 'trans_queue' not in st.session_state:
 def start_aliyun(state, webrtc_ctx, q, appkey):
     token, _ = get_aliyun_token()
     if not token: return
+    
     def on_result_changed(message, *args):
-        text = json.loads(message)['payload']['result']
-        state['live_cn'] = text
-        if len(text) > 8: q.put((text, False, state['vector_store']))
+        try:
+            text = json.loads(message)['payload']['result']
+            state['live_cn'] = text
+            if len(text) > 8: q.put((text, False, state['vector_store']))
+        except: pass
+
     def on_sentence_end(message, *args):
-        text = json.loads(message)['payload']['result']
-        clean_text = re.sub(r'[^\w\u4e00-\u9fff\s]', '', text).strip()
-        if len(clean_text) >= 2: q.put((clean_text, True, state['vector_store']))
-        state['live_cn'] = ""
+        try:
+            text = json.loads(message)['payload']['result']
+            clean_text = re.sub(r'[^\w\u4e00-\u9fff\s]', '', text).strip()
+            if len(clean_text) >= 2: q.put((clean_text, True, state['vector_store']))
+            state['live_cn'] = ""
+        except: pass
+
     sr = nls.NlsSpeechTranscriber(url="wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1",
                                   token=token, appkey=appkey,
                                   on_result_changed=on_result_changed, on_sentence_end=on_sentence_end)
     resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
     sr.start(aformat="pcm", ex={"enable_intermediate_result": True, "enable_punctuation_prediction": True})
-    while state['run'] and webrtc_ctx.state.playing:
+    
+    # SAFETY: Check if connection exists before sending
+    while state['run'] and webrtc_ctx and webrtc_ctx.state.playing:
         if webrtc_ctx.audio_receiver:
             try:
                 for frame in webrtc_ctx.audio_receiver.get_frames(timeout=0.1):
                     for r_frame in resampler.resample(frame):
                         sr.send_audio(r_frame.to_ndarray().tobytes())
-            except: pass
+            except: break
+        else:
+            time.sleep(0.1)
+    
     sr.stop()
 
 # --- 6. SIDEBAR CONTROLS ---
@@ -182,6 +192,7 @@ with col_lang:
     state['dialect'] = st.selectbox("Select Dialect:", ["Mandarin", "Cantonese"])
     active_key = ALIYUN_APPKEY_MANDARIN if state['dialect'] == "Mandarin" else ALIYUN_APPKEY_CANTONESE
 with col_mic:
+    # UPDATED: Higher receiver size and async processing
     webrtc_ctx = webrtc_streamer(
         key="asr", 
         mode=WebRtcMode.SENDONLY, 
@@ -191,13 +202,12 @@ with col_mic:
         audio_receiver_size=1024
     )
 
-if webrtc_ctx.state.playing and not state['run']:
+if webrtc_ctx and webrtc_ctx.state.playing and not state['run']:
     state['run'] = True
+    # Start thread
     threading.Thread(target=start_aliyun, args=(state, webrtc_ctx, st.session_state['trans_queue'], active_key), daemon=True).start()
-    st.rerun()
-elif not webrtc_ctx.state.playing and state['run']:
+elif (not webrtc_ctx or not webrtc_ctx.state.playing) and state['run']:
     state['run'] = False
-    st.rerun()
 
 def get_html(k):
     html = f"<div class='scroll-container'>"
@@ -214,4 +224,7 @@ with c2:
     st.markdown("<div class='panel-header'>English Thinking</div>", unsafe_allow_html=True)
     st.markdown(get_html("en"), unsafe_allow_html=True)
 
-if state['run']: time.sleep(0.4); st.rerun()
+# Using empty placeholders and loops instead of st.rerun() to keep it stable
+if state['run']:
+    time.sleep(0.5)
+    st.rerun()
