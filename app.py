@@ -79,17 +79,11 @@ def generate_dynamic_prompt(chinese_text, vector_store):
         except: pass
     return prompt
 
-# --- 4. STATE INITIALIZATION (FIXED) ---
+# --- 4. STATE INITIALIZATION ---
 if 'app_state' not in st.session_state:
     st.session_state['app_state'] = {
-        'history': [], 
-        'live_cn': "", 
-        'live_en': "", 
-        'run': False,
-        'vector_store': None, 
-        'status': "Idle", 
-        'dialect': "Mandarin", 
-        'last_latency': 0.0  # Explicitly initialized to 0
+        'history': [], 'live_cn': "", 'live_en': "", 'run': False,
+        'vector_store': None, 'status': "Idle", 'dialect': "Mandarin", 'last_latency': 0.0
     }
 state = st.session_state['app_state']
 
@@ -139,8 +133,8 @@ def start_aliyun(state, webrtc_ctx, q, appkey):
     def on_result_changed(message, *args):
         text = json.loads(message)['payload']['result']
         state['live_cn'] = text
-        # Throttled live update to keep English stable
-        if len(text) > 8 and len(text) % 5 == 0: 
+        # Throttled live update to keep English stable and prevent queue buildup
+        if len(text) > 10 and len(text) % 8 == 0: 
             q.put((text, False, state['vector_store']))
 
     def on_sentence_end(message, *args):
@@ -155,13 +149,22 @@ def start_aliyun(state, webrtc_ctx, q, appkey):
                                   on_result_changed=on_result_changed, on_sentence_end=on_sentence_end)
     resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
     sr.start(aformat="pcm", ex={"enable_intermediate_result": True, "enable_punctuation_prediction": True})
+    
     while state['run'] and webrtc_ctx.state.playing:
         if webrtc_ctx.audio_receiver:
             try:
-                for frame in webrtc_ctx.audio_receiver.get_frames(timeout=0.1):
-                    for r_frame in resampler.resample(frame):
+                # Optimized audio frame pulling
+                frames = webrtc_ctx.audio_receiver.get_frames(timeout=0.1)
+                for frame in frames:
+                    resampled_frames = resampler.resample(frame)
+                    for r_frame in resampled_frames:
                         sr.send_audio(r_frame.to_ndarray().tobytes())
-            except: pass
+            except queue.Empty:
+                pass
+            except:
+                break
+        else:
+            time.sleep(0.1)
     sr.stop()
 
 # --- 6. SIDEBAR ---
@@ -195,12 +198,14 @@ st.title("🪷 TBS Pro Translator")
 
 active_key = ALIYUN_APPKEY_MANDARIN if state['dialect'] == "Mandarin" else ALIYUN_APPKEY_CANTONESE
 webrtc_ctx = webrtc_streamer(
-    key="asr", mode=WebRtcMode.SENDONLY, 
+    key="asr", 
+    mode=WebRtcMode.SENDONLY, 
     rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
-    media_stream_constraints={"video": False, "audio": True}
+    media_stream_constraints={"video": False, "audio": True},
+    async_processing=True, # Enable async to help with the queue
+    audio_receiver_size=1024 # Bumping the 'bucket' size from 4 to 1024
 )
 
-# Status line (Now safe from KeyError)
 brain_count = state['vector_store'].index.ntotal if state['vector_store'] else 0
 st.caption(f"**Status:** {state['status']} | **Mode:** {state['dialect']} | **Latency:** {state['last_latency']}s | **🧠 Brain:** {brain_count} items")
 
