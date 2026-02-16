@@ -18,7 +18,7 @@ from aliyunsdkcore.request import CommonRequest
 from openai import OpenAI
 
 # --- RAG ---
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, CSVLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -41,10 +41,10 @@ st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;500;600&display=swap');
     html, body, [class*="css"]  { font-family: 'Open Sans', sans-serif !important; }
-    .scroll-container { display: flex; flex-direction: column-reverse; height: 48vh; min-height: 400px; overflow-y: auto; border: 1px solid #e0e0e0; border-radius: 8px; padding: 20px; background-color: #ffffff; margin-bottom: 20px; }
-    .committed-cn, .committed-en { font-size: 20px; color: #31333F; line-height: 1.6; font-weight: 400; }
-    .live-cn { font-size: 22px; color: #1565C0; font-weight: 600; line-height: 1.6; border-left: 4px solid #1565C0; padding-left: 12px; margin-bottom: 15px; }
-    .live-en { font-size: 22px; color: #E65100; font-weight: 600; line-height: 1.6; font-style: italic; border-left: 4px solid #E65100; padding-left: 12px; margin-bottom: 15px; }
+    .scroll-container { display: flex; flex-direction: column-reverse; height: 50vh; min-height: 400px; overflow-y: auto; border: 1px solid #e0e0e0; border-radius: 8px; padding: 20px; background-color: #ffffff; }
+    .committed-cn, .committed-en { font-size: 20px; color: #31333F; line-height: 1.6; }
+    .live-cn { font-size: 22px; color: #1565C0; font-weight: 600; line-height: 1.6; border-left: 4px solid #1565C0; padding-left: 12px; }
+    .live-en { font-size: 22px; color: #E65100; font-weight: 600; line-height: 1.6; font-style: italic; border-left: 4px solid #E65100; padding-left: 12px; }
     .sep { border: 0; border-top: 1px solid #f0f2f6; margin: 15px 0; }
     .panel-header { font-size: 14px; font-weight: 600; text-transform: uppercase; color: #757575; margin-bottom: 8px; }
 </style>
@@ -77,159 +77,119 @@ def generate_dynamic_prompt(chinese_text, vector_store):
         except: pass
     return prompt
 
-# --- 4. STATE & WORKER ---
-if 'app_state' not in st.session_state:
-    st.session_state['app_state'] = {
-        'history': [], 'live_cn': "", 'live_en': "", 'run': False,
-        'vector_store': None, 'dialect': "Mandarin"
-    }
-state = st.session_state['app_state']
+# --- 4. STATE ---
+if 'history' not in st.session_state: st.session_state.history = []
+if 'live_cn' not in st.session_state: st.session_state.live_cn = ""
+if 'live_en' not in st.session_state: st.session_state.live_en = ""
+if 'vector_store' not in st.session_state: st.session_state.vector_store = None
+if 'dialect' not in st.session_state: st.session_state.dialect = "Mandarin"
 
-if state['vector_store'] is None and os.path.exists(DB_PATH):
+if st.session_state.vector_store is None and os.path.exists(DB_PATH):
     try:
-        state['vector_store'] = FAISS.load_local(DB_PATH, get_embedding_model(), allow_dangerous_deserialization=True)
+        st.session_state.vector_store = FAISS.load_local(DB_PATH, get_embedding_model(), allow_dangerous_deserialization=True)
     except: pass
 
-if 'trans_queue' not in st.session_state:
-    st.session_state['trans_queue'] = queue.Queue(maxsize=10) # Set limit to prevent backlog
-    def translation_worker(q, app_state):
-        while True:
-            item = q.get()
-            if item is None: break
-            text, is_final, v_store = item
-            try:
-                prompt = generate_dynamic_prompt(text, v_store)
-                response = deepseek_client.chat.completions.create(
-                    model="deepseek-chat",
-                    messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
-                    stream=True, temperature=0.1
-                )
-                full_res = ""
-                for chunk in response:
-                    content = chunk.choices[0].delta.content
-                    if content:
-                        full_res += content
-                        if not is_final: app_state['live_en'] = full_res + "..."
-                
-                if is_final:
-                    clean_res = re.sub(r'[\u4e00-\u9fff]+', '', full_res).strip()
-                    app_state['history'].append({"cn": text, "en": clean_res})
-                    app_state['live_en'] = ""
-            except: pass
-            finally: q.task_done()
-    threading.Thread(target=translation_worker, args=(st.session_state['trans_queue'], state), daemon=True).start()
+# --- 5. THE TRANSLATION ENGINE ---
+def run_translation(text, is_final):
+    try:
+        prompt = generate_dynamic_prompt(text, st.session_state.vector_store)
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
+            stream=True, temperature=0.1
+        )
+        full_res = ""
+        for chunk in response:
+            content = chunk.choices[0].delta.content
+            if content:
+                full_res += content
+                if not is_final: st.session_state.live_en = full_res + "..."
+        
+        if is_final:
+            clean_res = re.sub(r'[\u4e00-\u9fff]+', '', full_res).strip()
+            st.session_state.history.append({"cn": text, "en": clean_res})
+            st.session_state.live_en = ""
+    except: pass
 
-# --- 5. ALIYUN ENGINE ---
-def start_aliyun(state, webrtc_ctx, q, appkey):
-    token, _ = get_aliyun_token()
-    if not token: return
-    
-    def on_result_changed(message, *args):
-        try:
+# --- 6. ALIYUN ENGINE ---
+def audio_frame_callback(frame: av.AudioFrame):
+    # This is much more stable than threading for high receiver sizes
+    if "sr" not in st.session_state:
+        token, _ = get_aliyun_token()
+        appkey = ALIYUN_APPKEY_MANDARIN if st.session_state.dialect == "Mandarin" else ALIYUN_APPKEY_CANTONESE
+        
+        def on_sentence_end(message, *args):
             text = json.loads(message)['payload']['result']
-            state['live_cn'] = text
-            # Throttling: only send to DeepSeek for live preview if the text is significant
-            if len(text) > 10 and len(text) % 5 == 0: 
-                q.put((text, False, state['vector_store']), block=False)
-        except queue.Full: pass
-        except: pass
+            run_translation(text, True)
+            st.session_state.live_cn = ""
 
-    def on_sentence_end(message, *args):
-        try:
-            text = json.loads(message)['payload']['result']
-            clean_text = re.sub(r'[^\w\u4e00-\u9fff\s]', '', text).strip()
-            if len(clean_text) >= 2: 
-                q.put((clean_text, True, state['vector_store']), block=True)
-            state['live_cn'] = ""
-        except: pass
+        st.session_state.sr = nls.NlsSpeechTranscriber(
+            url="wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1",
+            token=token, appkey=appkey,
+            on_result_changed=lambda m, *a: setattr(st.session_state, 'live_cn', json.loads(m)['payload']['result']),
+            on_sentence_end=on_sentence_end
+        )
+        st.session_state.resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
+        st.session_state.sr.start(aformat="pcm", ex={"enable_intermediate_result": True, "enable_punctuation_prediction": True})
 
-    sr = nls.NlsSpeechTranscriber(url="wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1",
-                                  token=token, appkey=appkey,
-                                  on_result_changed=on_result_changed, on_sentence_end=on_sentence_end)
-    resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
-    sr.start(aformat="pcm", ex={"enable_intermediate_result": True, "enable_punctuation_prediction": True})
-    
-    while state['run'] and webrtc_ctx and webrtc_ctx.state.playing:
-        if webrtc_ctx.audio_receiver:
-            try:
-                # Optimized audio pulling: Drain the internal buffer completely
-                frames = webrtc_ctx.audio_receiver.get_frames(timeout=0.1)
-                for frame in frames:
-                    for r_frame in resampler.resample(frame):
-                        sr.send_audio(r_frame.to_ndarray().tobytes())
-            except: break
-        else:
-            time.sleep(0.1)
-    sr.stop()
-
-# --- 6. SIDEBAR ---
-with st.sidebar:
-    st.header("⚙️ Admin")
-    if st.button("🧹 Clear Conversation"):
-        state['history'] = []
-        state['live_cn'] = ""; state['live_en'] = ""
-        st.rerun()
-    st.divider()
-    brain_count = state['vector_store'].index.ntotal if state['vector_store'] else 0
-    st.write(f"🧠 Brain: **{brain_count}** items")
-    uploaded_files = st.file_uploader("Expand Knowledge", type=['pdf', 'txt', 'csv'], accept_multiple_files=True)
-    if st.button("Learn"):
-        if uploaded_files:
-            with st.spinner("Processing..."):
-                docs = []
-                for uf in uploaded_files:
-                    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                        tmp.write(uf.getvalue()); tmp_p = tmp.name
-                    loader = PyPDFLoader(tmp_p) if uf.name.endswith('.pdf') else TextLoader(tmp_p)
-                    docs.extend(loader.load()); os.remove(tmp_p)
-                chunks = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=50).split_documents(docs)
-                if state['vector_store'] is None: state['vector_store'] = FAISS.from_documents(chunks, get_embedding_model())
-                else: state['vector_store'].add_documents(chunks)
-                state['vector_store'].save_local(DB_PATH); st.rerun()
+    for r_frame in st.session_state.resampler.resample(frame):
+        st.session_state.sr.send_audio(r_frame.to_ndarray().tobytes())
+    return frame
 
 # --- 7. MAIN UI ---
-st.title("🪷 TBS Live Translator")
+st.title("🪷 TBS Pro Translator")
 
-c_top1, c_top2 = st.columns(2)
-with c_top1:
-    state['dialect'] = st.selectbox("Language:", ["Mandarin", "Cantonese"])
-    active_key = ALIYUN_APPKEY_MANDARIN if state['dialect'] == "Mandarin" else ALIYUN_APPKEY_CANTONESE
-with c_top2:
+with st.sidebar:
+    st.header("⚙️ Settings")
+    st.session_state.dialect = st.selectbox("Speech Dialect:", ["Mandarin", "Cantonese"])
+    if st.button("🧹 Clear History"):
+        st.session_state.history = []; st.rerun()
+    st.divider()
+    brain_count = st.session_state.vector_store.index.ntotal if st.session_state.vector_store else 0
+    st.info(f"🧠 Brain: {brain_count} items")
+
+# Manual Input Tab
+tab_voice, tab_manual = st.tabs(["🎙️ Voice", "⌨️ Manual"])
+
+with tab_voice:
     webrtc_ctx = webrtc_streamer(
-        key="asr", 
-        mode=WebRtcMode.SENDONLY, 
+        key="asr",
+        mode=WebRtcMode.SENDONLY,
         rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
         media_stream_constraints={"video": False, "audio": True},
-        async_processing=True,
-        audio_receiver_size=4096 
+        audio_frame_callback=audio_frame_callback, # Using callback for stability
     )
 
-if webrtc_ctx and webrtc_ctx.state.playing and not state['run']:
-    state['run'] = True
-    threading.Thread(target=start_aliyun, args=(state, webrtc_ctx, st.session_state['trans_queue'], active_key), daemon=True).start()
-elif (not webrtc_ctx or not webrtc_ctx.state.playing) and state['run']:
-    state['run'] = False
+with tab_manual:
+    m_input = st.text_area("Type Chinese:")
+    if st.button("Translate Text"):
+        run_translation(m_input, True)
+
+# Cleanup: If mic is off, stop the transcriber
+if webrtc_ctx and not webrtc_ctx.state.playing and "sr" in st.session_state:
+    st.session_state.sr.stop()
+    del st.session_state.sr
 
 st.divider()
 
-# --- PANEL DISPLAY ---
-def get_panel_html(kind):
+# --- DISPLAY PANELS ---
+def get_html(k):
     html = f"<div class='scroll-container'>"
-    if state[f'live_{kind}']:
-        html += f"<div class='live-{kind}'>{state[f'live_{kind}']}</div>"
-    for entry in reversed(state['history']):
-        html += f"<div class='committed-{kind}'>{entry[kind]}</div><hr class='sep'>"
+    if st.session_state[f'live_{k}']:
+        html += f"<div class='live-{k}'>{st.session_state[f'live_{k}']}</div>"
+    for i in reversed(st.session_state.history):
+        html += f"<div class='committed-{k}'>{i[k]}</div><hr class='sep'>"
     return html + "</div>"
 
-col_left, col_right = st.columns(2)
-with col_left:
-    st.markdown("<div class='panel-header'>Chinese Listening</div>", unsafe_allow_html=True)
-    st.markdown(get_panel_html("cn"), unsafe_allow_html=True)
-with col_right:
-    st.markdown("<div class='panel-header'>English Thinking</div>", unsafe_allow_html=True)
-    st.markdown(get_panel_html("en"), unsafe_allow_html=True)
+c1, c2 = st.columns(2)
+with c1:
+    st.markdown("<div class='panel-header'>Chinese Source</div>", unsafe_allow_html=True)
+    st.markdown(get_html("cn"), unsafe_allow_html=True)
+with c2:
+    st.markdown("<div class='panel-header'>English Translation</div>", unsafe_allow_html=True)
+    st.markdown(get_html("en"), unsafe_allow_html=True)
 
-# THE HEARTBEAT: Slightly slower refresh to prevent background thread starvation
-if state['run']:
-    time.sleep(0.5)
+# Heartbeat UI refresh
+if webrtc_ctx and webrtc_ctx.state.playing:
+    time.sleep(0.4)
     st.rerun()
