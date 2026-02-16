@@ -79,11 +79,17 @@ def generate_dynamic_prompt(chinese_text, vector_store):
         except: pass
     return prompt
 
-# --- 4. STATE & WORKER ---
+# --- 4. STATE INITIALIZATION (FIXED) ---
 if 'app_state' not in st.session_state:
     st.session_state['app_state'] = {
-        'history': [], 'live_cn': "", 'live_en': "", 'run': False,
-        'vector_store': None, 'status': "Idle", 'dialect': "Mandarin", 'last_latency': 0
+        'history': [], 
+        'live_cn': "", 
+        'live_en': "", 
+        'run': False,
+        'vector_store': None, 
+        'status': "Idle", 
+        'dialect': "Mandarin", 
+        'last_latency': 0.0  # Explicitly initialized to 0
     }
 state = st.session_state['app_state']
 
@@ -108,13 +114,11 @@ if 'trans_queue' not in st.session_state:
                     stream=True, temperature=0.1
                 )
                 
-                # FIXED: Accumulate stream instead of overwriting live state instantly
                 temp_full_res = ""
                 for chunk in response:
                     content = chunk.choices[0].delta.content
                     if content:
                         temp_full_res += content
-                        # Only update live_en if we aren't at the end of a sentence
                         if not is_final:
                             app_state['live_en'] = temp_full_res
                 
@@ -123,7 +127,7 @@ if 'trans_queue' not in st.session_state:
                     latency = round(time.time() - start_t, 2)
                     app_state['last_latency'] = latency
                     app_state['history'].append({"cn": text, "en": clean_res, "lat": latency})
-                    app_state['live_en'] = "" # ONLY clear once final is committed
+                    app_state['live_en'] = ""
             except: pass
             finally: q.task_done()
     threading.Thread(target=translation_worker, args=(st.session_state['trans_queue'], state), daemon=True).start()
@@ -135,8 +139,8 @@ def start_aliyun(state, webrtc_ctx, q, appkey):
     def on_result_changed(message, *args):
         text = json.loads(message)['payload']['result']
         state['live_cn'] = text
-        # Only request live translation if text has significantly changed to prevent flickering
-        if len(text) > 8 and len(text) % 4 == 0: 
+        # Throttled live update to keep English stable
+        if len(text) > 8 and len(text) % 5 == 0: 
             q.put((text, False, state['vector_store']))
 
     def on_sentence_end(message, *args):
@@ -167,6 +171,7 @@ with st.sidebar:
     st.divider()
     if st.button("🧹 Clear History"):
         state['history'] = []
+        state['last_latency'] = 0.0
         st.rerun()
     st.divider()
     st.subheader("🧠 Brain")
@@ -195,8 +200,9 @@ webrtc_ctx = webrtc_streamer(
     media_stream_constraints={"video": False, "audio": True}
 )
 
-brain_status = f"🧠 {state['vector_store'].index.ntotal} items" if state['vector_store'] else "🧠 Empty"
-st.caption(f"**Status:** {state['status']} | **Mode:** {state['dialect']} | **Latency:** {state['last_latency']}s | **{brain_status}**")
+# Status line (Now safe from KeyError)
+brain_count = state['vector_store'].index.ntotal if state['vector_store'] else 0
+st.caption(f"**Status:** {state['status']} | **Mode:** {state['dialect']} | **Latency:** {state['last_latency']}s | **🧠 Brain:** {brain_count} items")
 
 if webrtc_ctx.state.playing and not state['run']:
     state['run'] = True
