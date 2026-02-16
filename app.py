@@ -1,12 +1,17 @@
 import streamlit as st
 import time
+import threading
 import queue
 import re
 import os
+import tempfile
+import shutil
 import json
-import av
-import threading
+import traceback
+
+# --- WEB AUDIO LIBRARIES ---
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import av
 
 # --- ALIBABA & OPENAI ---
 import nls
@@ -15,172 +20,236 @@ from aliyunsdkcore.request import CommonRequest
 from openai import OpenAI
 
 # --- RAG ---
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, CSVLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
-# --- 1. GLOBAL QUEUES (Thread-Safe, Context-Independent) ---
-if "CN_LIVE_Q" not in st.session_state:
-    st.session_state.CN_LIVE_Q = queue.Queue()
-if "TRANSLATE_Q" not in st.session_state:
-    st.session_state.TRANSLATE_Q = queue.Queue()
-if "HISTORY_Q" not in st.session_state:
-    st.session_state.HISTORY_Q = queue.Queue()
+# --- 1. CONFIGURATION (ST.SECRETS FOR ONLINE) ---
+try:
+    ALIYUN_AK_ID = st.secrets["ALIYUN_AK_ID"]
+    ALIYUN_AK_SECRET = st.secrets["ALIYUN_AK_SECRET"]
+    DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
+except KeyError:
+    st.error("Please set ALIYUN_AK_ID, ALIYUN_AK_SECRET, and DEEPSEEK_API_KEY in Streamlit Secrets.")
+    st.stop()
 
-# --- 2. CONFIG & SECRETS (Fetched ONCE in main thread) ---
-AK_ID = st.secrets["ALIYUN_AK_ID"]
-AK_SECRET = st.secrets["ALIYUN_AK_SECRET"]
-DS_KEY = st.secrets["DEEPSEEK_API_KEY"]
-APP_MANDARIN = "kNPPGUGiUNqBa7DB"
-APP_CANTONESE = "B63clvkhBpyeehDk"
+ALIYUN_APPKEY_MANDARIN = "kNPPGUGiUNqBa7DB"
+ALIYUN_APPKEY_CANTONESE = "B63clvkhBpyeehDk"
+
 DB_PATH = "tbs_knowledge_db"
+deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-deepseek_client = OpenAI(api_key=DS_KEY, base_url="https://api.deepseek.com")
+st.set_page_config(page_title="TBS Pro Teleprompter", layout="wide", initial_sidebar_state="expanded")
 
-st.set_page_config(page_title="TBS Pro Translator", layout="wide")
-
-# --- 3. CSS (Google Translate Style) ---
+# --- 2. CSS STYLING ---
 st.markdown("""
 <style>
-    .translation-card { background-color: #f8f9fa; border: 1px solid #dadce0; border-radius: 8px; padding: 24px; height: 52vh; overflow-y: auto; }
-    .text-display { font-size: 22px; color: #3c4043; line-height: 1.6; margin-bottom: 20px; }
-    .target-display { font-size: 24px; color: #1a73e8; line-height: 1.6; font-weight: 400; margin-bottom: 20px; }
-    .live-stream { color: #e67e22; font-style: italic; border-left: 4px solid #e67e22; padding-left: 12px; }
-    .panel-header { font-size: 13px; font-weight: 600; text-transform: uppercase; color: #70757a; margin-bottom: 8px; }
+    @import url('https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;500;600&display=swap');
+    html, body, [class*="css"]  { font-family: 'Open Sans', sans-serif !important; }
+    .scroll-container { 
+        height: 48vh; 
+        min-height: 400px; 
+        overflow-y: auto; 
+        border: 1px solid #e0e0e0; 
+        border-radius: 8px; 
+        padding: 20px; 
+        background-color: #ffffff; 
+        margin-bottom: 20px; 
+        display: flex;
+        flex-direction: column;
+    }
+    .committed-cn, .committed-en { font-size: 19px; color: #31333F; line-height: 1.6; font-weight: 400; margin-bottom: 10px; }
+    .live-cn { font-size: 20px; color: #1565C0; font-weight: 600; line-height: 1.6; margin-bottom: 15px; border-left: 3px solid #1565C0; padding-left: 10px; }
+    .live-en { font-size: 20px; color: #E65100; font-weight: 600; line-height: 1.6; font-style: italic; margin-bottom: 15px; border-left: 3px solid #E65100; padding-left: 10px; }
+    .sep { border: 0; border-top: 1px solid #f0f2f6; margin: 15px 0; }
+    .panel-header { font-size: 13px; font-weight: 600; text-transform: uppercase; color: #757575; margin-bottom: 5px; }
+    .latency-tag { font-size: 11px; color: #9e9e9e; margin-top: -5px; margin-bottom: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 4. DATA & RAG ---
-if 'history' not in st.session_state: st.session_state.history = []
-if 'live_cn' not in st.session_state: st.session_state.live_cn = ""
-if 'dialect' not in st.session_state: st.session_state.dialect = "Mandarin"
+# --- 3. CORE LOGIC ---
+def get_aliyun_token():
+    try:
+        client = AcsClient(ALIYUN_AK_ID, ALIYUN_AK_SECRET, "ap-southeast-1")
+        request = CommonRequest()
+        request.set_method('POST')
+        request.set_domain('nlsmeta.ap-southeast-1.aliyuncs.com')
+        request.set_version('2019-07-17')
+        request.set_action_name('CreateToken')
+        response_dict = json.loads(client.do_action_with_exception(request))
+        return response_dict['Token']['Id'], None
+    except Exception as e: return None, str(e)
 
 @st.cache_resource
-def get_brain():
-    try:
-        model = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-        if os.path.exists(DB_PATH):
-            return FAISS.load_local(DB_PATH, model, allow_dangerous_deserialization=True)
-    except: return None
-    return None
+def get_embedding_model():
+    return HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
-vector_store = get_brain()
+def generate_dynamic_prompt(chinese_text, vector_store):
+    prompt = "You are the official TBS translator. Rules: 1. 100% English. 2. Terms: 蓮生活佛=Living Buddha Lian-sheng, 師尊=Grand Master. Output ONLY translation."
+    if vector_store:
+        try:
+            docs = vector_store.similarity_search(chinese_text, k=2)
+            if docs:
+                prompt += "\nRef terms: " + " ".join([d.page_content for d in docs])
+        except: pass
+    return prompt
 
-# --- 5. TRANSLATION WORKER ---
-def translation_job(text, v_store, hist_q):
-    """Runs in a background thread, pushes result to HISTORY_Q"""
-    prompt = "You are the official TBS translator. 100% English. Terms: 蓮生活佛=Living Buddha Lian-sheng, 師尊=Grand Master."
-    if v_store:
-        docs = v_store.similarity_search(text, k=2)
-        prompt += "\nRef: " + " ".join([d.page_content for d in docs])
-    
+# --- 4. STATE & WORKER ---
+if 'app_state' not in st.session_state:
+    st.session_state['app_state'] = {
+        'history': [], 'live_cn': "", 'live_en': "", 'run': False,
+        'vector_store': None, 'status': "Idle", 'dialect': "Mandarin", 'last_latency': 0.0
+    }
+state = st.session_state['app_state']
+
+if state['vector_store'] is None and os.path.exists(DB_PATH):
     try:
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
-            temperature=0.1
-        )
-        res = response.choices[0].message.content.strip()
-        hist_q.put({"cn": text, "en": re.sub(r'[\u4e00-\u9fff]+', '', res)})
+        state['vector_store'] = FAISS.load_local(DB_PATH, get_embedding_model(), allow_dangerous_deserialization=True)
     except: pass
 
-# --- 6. AUDIO CALLBACK (THREAD-SAFE) ---
-def audio_frame_callback(frame: av.AudioFrame):
-    # NEVER touch st.session_state or st.secrets here. Use local variables.
-    if not hasattr(audio_frame_callback, "sr"):
-        # Initialize Alibaba using variables passed from the main thread
-        client = AcsClient(AK_ID, AK_SECRET, "ap-southeast-1")
-        req = CommonRequest(); req.set_method('POST'); req.set_domain('nlsmeta.ap-southeast-1.aliyuncs.com')
-        req.set_version('2019-07-17'); req.set_action_name('CreateToken')
-        token = json.loads(client.do_action_with_exception(req))['Token']['Id']
-        appkey = APP_MANDARIN if st.session_state.dialect == "Mandarin" else APP_CANTONESE
+if 'trans_queue' not in st.session_state:
+    st.session_state['trans_queue'] = queue.Queue()
+    def translation_worker(q, app_state):
+        while True:
+            item = q.get()
+            if item is None: break
+            text, is_final, v_store = item
+            start_t = time.time()
+            try:
+                prompt = generate_dynamic_prompt(text, v_store)
+                response = deepseek_client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
+                    stream=True, temperature=0.1
+                )
+                full_res = ""
+                for chunk in response:
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        full_res += content
+                        if not is_final: app_state['live_en'] = full_res + "..."
+                if is_final:
+                    clean_res = re.sub(r'[\u4e00-\u9fff]+', '', full_res).strip()
+                    lat = round(time.time() - start_t, 2)
+                    app_state['history'].append({"cn": text, "en": clean_res, "lat": lat})
+                    app_state['live_en'] = ""
+                    app_state['last_latency'] = lat
+            except: pass
+            finally: q.task_done()
+    threading.Thread(target=translation_worker, args=(st.session_state['trans_queue'], state), daemon=True).start()
 
-        audio_frame_callback.sr = nls.NlsSpeechTranscriber(
-            url="wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1",
-            token=token, appkey=appkey,
-            on_result_changed=lambda m, *a: st.session_state.CN_LIVE_Q.put(json.loads(m)['payload']['result']),
-            on_sentence_end=lambda m, *a: st.session_state.TRANSLATE_Q.put(json.loads(m)['payload']['result'])
-        )
-        audio_frame_callback.resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
-        audio_frame_callback.sr.start(aformat="pcm", ex={"enable_intermediate_result": True, "enable_punctuation_prediction": True})
+# --- 5. ALIYUN ENGINE ---
+def start_aliyun(state, webrtc_ctx, q, appkey):
+    token, _ = get_aliyun_token()
+    if not token: return
+    def on_result_changed(message, *args):
+        text = json.loads(message)['payload']['result']
+        state['live_cn'] = text
+        if len(text) > 10 and len(text) % 8 == 0: q.put((text, False, state['vector_store']))
+    def on_sentence_end(message, *args):
+        text = json.loads(message)['payload']['result']
+        clean_text = re.sub(r'[^\w\u4e00-\u9fff\s]', '', text).strip()
+        if len(clean_text) >= 2: q.put((clean_text, True, state['vector_store']))
+        state['live_cn'] = ""
+    sr = nls.NlsSpeechTranscriber(url="wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1",
+                                  token=token, appkey=appkey,
+                                  on_result_changed=on_result_changed, on_sentence_end=on_sentence_end)
+    resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
+    sr.start(aformat="pcm", ex={"enable_intermediate_result": True, "enable_punctuation_prediction": True})
+    while state['run'] and webrtc_ctx.state.playing:
+        if webrtc_ctx.audio_receiver:
+            try:
+                frames = webrtc_ctx.audio_receiver.get_frames(timeout=0.1)
+                for frame in frames:
+                    for r_frame in resampler.resample(frame):
+                        sr.send_audio(r_frame.to_ndarray().tobytes())
+            except: break
+    sr.stop()
 
-    for r_frame in audio_frame_callback.resampler.resample(frame):
-        audio_frame_callback.sr.send_audio(r_frame.to_ndarray().tobytes())
-    return frame
+# --- 6. SIDEBAR & ADMIN ---
+with st.sidebar:
+    st.header("⚙️ Settings")
+    state['dialect'] = st.selectbox("Dialect:", ["Mandarin", "Cantonese"])
+    if st.button("🧹 Clear History"):
+        state['history'] = []
+        st.rerun()
+    st.divider()
+    st.subheader("🧠 Brain Status")
+    brain_count = state['vector_store'].index.ntotal if state['vector_store'] else 0
+    st.info(f"Loaded fragments: {brain_count}")
+    
+    up = st.file_uploader("Upload Teachings", type=['pdf', 'txt', 'csv'], accept_multiple_files=True)
+    if st.button("➕ Train"):
+        if up:
+            with st.spinner("Learning..."):
+                docs = []
+                for uf in up:
+                    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                        tmp.write(uf.getvalue()); tmp_p = tmp.name
+                    ldr = PyPDFLoader(tmp_p) if uf.name.endswith('.pdf') else TextLoader(tmp_p)
+                    docs.extend(ldr.load()); os.remove(tmp_p)
+                chnk = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=50).split_documents(docs)
+                if state['vector_store'] is None: state['vector_store'] = FAISS.from_documents(chnk, get_embedding_model())
+                else: state['vector_store'].add_documents(chnk)
+                state['vector_store'].save_local(DB_PATH); st.rerun()
 
-# --- 7. UI ---
+# --- 7. MAIN UI TABS ---
 st.title("🪷 TBS Pro Translator")
 
-tab_v, tab_m = st.tabs(["🎙️ Voice Mode", "⌨️ Manual Mode"])
+tab_voice, tab_manual = st.tabs(["🎙️ Voice Translation", "⌨️ Manual Text"])
 
-with tab_v:
-    webrtc_ctx = webrtc_streamer(
-        key="asr",
-        mode=WebRtcMode.SENDONLY,
-        rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
-        media_stream_constraints={"video": False, "audio": True},
-        audio_frame_callback=audio_frame_callback,
-        async_processing=True,
-        audio_receiver_size=4096
-    )
+with tab_voice:
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        active_key = ALIYUN_APPKEY_MANDARIN if state['dialect'] == "Mandarin" else ALIYUN_APPKEY_CANTONESE
+        webrtc_ctx = webrtc_streamer(
+            key="asr", mode=WebRtcMode.SENDONLY, 
+            rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
+            media_stream_constraints={"video": False, "audio": True},
+            async_processing=True,
+            audio_receiver_size=4096 # BUFFER FIX
+        )
+    with c2:
+        st.caption(f"Status: {state['status']} | Latency: {state['last_latency']}s | 🧠 RAG: {brain_count}")
 
-with tab_m:
-    m_in = st.text_area("Manual Input (Chinese):", height=100)
-    if st.button("Translate Text"):
-        threading.Thread(target=translation_job, args=(m_in, vector_store, st.session_state.HISTORY_Q)).start()
+with tab_manual:
+    m_input = st.text_area("Chinese Input:", placeholder="Paste text and press Ctrl+Enter...")
+    if m_input and (not state['history'] or m_input != state['history'][-1]['cn']):
+        # Instant trigger on content change
+        st.session_state['trans_queue'].put((m_input, True, state['vector_store']))
 
-# --- 8. THE CONTROLLER (Drains Queues & Updates UI) ---
-if webrtc_ctx.state.playing:
-    # 1. Update Live CN
-    while not st.session_state.CN_LIVE_Q.empty():
-        st.session_state.live_cn = st.session_state.CN_LIVE_Q.get()
-    
-    # 2. Trigger Translations
-    while not st.session_state.TRANSLATE_Q.empty():
-        final_txt = st.session_state.TRANSLATE_Q.get()
-        threading.Thread(target=translation_job, args=(final_txt, vector_store, st.session_state.HISTORY_Q)).start()
-    
-    # 3. Collect History
-    while not st.session_state.HISTORY_Q.empty():
-        st.session_state.history.append(st.session_state.HISTORY_Q.get())
-        st.session_state.live_cn = ""
-
-    time.sleep(0.1)
-    st.rerun()
-
-elif hasattr(audio_frame_callback, "sr"):
-    try: audio_frame_callback.sr.stop()
-    except: pass
-    del audio_frame_callback.sr
+if webrtc_ctx.state.playing and not state['run']:
+    state['run'] = True
+    threading.Thread(target=start_aliyun, args=(state, webrtc_ctx, st.session_state['trans_queue'], active_key), daemon=True).start()
+elif not webrtc_ctx.state.playing and state['run']:
+    state['run'] = False
 
 st.divider()
 
-# --- 9. DISPLAY PANELS ---
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown("<div class='panel-header'>Source</div>", 1)
-    src_h = "<div class='translation-card'>"
-    if st.session_state.live_cn:
-        src_h += f"<div class='text-display live-stream'>{st.session_state.live_cn}</div>"
-    for i in reversed(st.session_state.history):
-        src_h += f"<div class='text-display'>{i['cn']}</div><hr>"
-    st.markdown(src_h + "</div>", unsafe_allow_html=True)
+# --- 8. BILINGUAL DISPLAY PANELS ---
+col_cn, col_en = st.columns(2)
 
-with c2:
-    st.markdown("<div class='panel-header'>Translation</div>", 1)
-    tar_h = "<div class='translation-card'>"
-    for i in reversed(st.session_state.history):
-        # Text result
-        st.markdown(f"<div class='target-display'>{i['en']}</div>", unsafe_allow_html=True)
-        # Copy Icon (Google Style)
-        st.code(i['en'], language="text")
-        st.divider()
-    st.markdown("</div>", unsafe_allow_html=True)
+with col_cn:
+    st.markdown("<div class='panel-header'>Chinese Source</div>", unsafe_allow_html=True)
+    with st.container(border=True, height=500):
+        if state['live_cn']:
+            st.markdown(f"<div class='live-cn'>{state['live_cn']}</div>", unsafe_allow_html=True)
+        for i in reversed(state['history']):
+            st.markdown(f"<div class='committed-cn'>{i['cn']}</div>", unsafe_allow_html=True)
+            st.divider()
 
-with st.sidebar:
-    st.header("Settings")
-    st.session_state.dialect = st.selectbox("Dialect:", ["Mandarin", "Cantonese"])
-    st.write(f"🧠 Brain: {vector_store.index.ntotal if vector_store else 0} fragments")
-    if st.button("Clear Conversation"):
-        st.session_state.history = []
-        st.rerun()
+with col_en:
+    st.markdown("<div class='panel-header'>English Translation</div>", unsafe_allow_html=True)
+    with st.container(border=True, height=500):
+        if state['live_en']:
+            st.markdown(f"<div class='live-en'>{state['live_en']}</div>", unsafe_allow_html=True)
+        for i in reversed(state['history']):
+            st.markdown(f"<div class='committed-en'>{i['en']}</div>", unsafe_allow_html=True)
+            st.code(i['en'], language="text") # COPY ICON FIX
+            st.markdown(f"<div class='latency-tag'>Lat: {i['lat']}s</div>", unsafe_allow_html=True)
+            st.divider()
+
+if state['run']: 
+    time.sleep(0.4)
+    st.rerun()
