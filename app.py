@@ -44,7 +44,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. PERSISTENT STATE ---
+# --- 3. GLOBAL BUFFERS ---
+# Using standard queues to bypass Streamlit's Thread context issues
+if 'cn_buf' not in st.session_state: st.session_state.cn_buf = queue.Queue()
+if 'en_buf' not in st.session_state: st.session_state.en_buf = queue.Queue()
+
+# --- 4. PERSISTENT STATE ---
 if 'history' not in st.session_state: st.session_state.history = []
 if 'live_cn' not in st.session_state: st.session_state.live_cn = ""
 if 'dialect' not in st.session_state: st.session_state.dialect = "Mandarin"
@@ -60,56 +65,53 @@ def get_brain():
 
 vector_store = get_brain()
 
-# --- 4. ENGINE FUNCTIONS ---
+# --- 5. ENGINE FUNCTIONS ---
 def get_aliyun_token():
     client = AcsClient(ALIYUN_AK_ID, ALIYUN_AK_SECRET, "ap-southeast-1")
     req = CommonRequest(); req.set_method('POST'); req.set_domain('nlsmeta.ap-southeast-1.aliyuncs.com')
     req.set_version('2019-07-17'); req.set_action_name('CreateToken')
     return json.loads(client.do_action_with_exception(req))['Token']['Id']
 
-def translate_logic(text):
+def translate_callback_logic(text):
+    """Runs in background, pushes result to buffer"""
     prompt = "You are the official TBS translator. 100% English. Terms: 蓮生活佛=Living Buddha Lian-sheng, 師尊=Grand Master."
     if vector_store:
         docs = vector_store.similarity_search(text, k=2)
         prompt += "\nRef: " + " ".join([d.page_content for d in docs])
-    
     try:
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
             temperature=0.1
         )
-        res_text = response.choices[0].message.content.strip()
-        clean_res = re.sub(r'[\u4e00-\u9fff]+', '', res_text)
-        # Directly append to history without triggering rerun
-        st.session_state.history.append({"cn": text, "en": clean_res})
+        res = response.choices[0].message.content.strip()
+        st.session_state.en_buf.put({"cn": text, "en": re.sub(r'[\u4e00-\u9fff]+', '', res)})
     except: pass
 
-# --- 5. THE CALLBACK HANDLER ---
-# This function runs inside the WebRTC engine. 
-# It handles audio frames without needing a main thread refresh.
+# --- 6. THE SAFE CALLBACK ---
 def audio_frame_callback(frame: av.AudioFrame):
-    if "sr" not in st.session_state:
+    # This thread NEVER touches st.session_state directly
+    if not hasattr(st.session_state, "_asr_sr"):
         token = get_aliyun_token()
         appkey = ALIYUN_APP_MANDARIN if st.session_state.dialect == "Mandarin" else ALIYUN_APP_CANTONESE
         
-        st.session_state.sr = nls.NlsSpeechTranscriber(
+        st.session_state._asr_sr = nls.NlsSpeechTranscriber(
             url="wss://nls-gateway-ap-southeast-1.aliyuncs.com/ws/v1",
             token=token, appkey=appkey,
-            on_result_changed=lambda m, *a: setattr(st.session_state, 'live_cn', json.loads(m)['payload']['result']),
-            on_sentence_end=lambda m, *a: translate_logic(json.loads(m)['payload']['result'])
+            on_result_changed=lambda m, *a: st.session_state.cn_buf.put(json.loads(m)['payload']['result']),
+            on_sentence_end=lambda m, *a: threading.Thread(target=translate_callback_logic, args=(json.loads(m)['payload']['result'],)).start()
         )
-        st.session_state.resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
-        st.session_state.sr.start(aformat="pcm", ex={"enable_intermediate_result": True, "enable_punctuation_prediction": True})
+        st.session_state._asr_resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
+        st.session_state._asr_sr.start(aformat="pcm", ex={"enable_intermediate_result": True, "enable_punctuation_prediction": True})
 
-    for r_frame in st.session_state.resampler.resample(frame):
-        st.session_state.sr.send_audio(r_frame.to_ndarray().tobytes())
+    for r_frame in st.session_state._asr_resampler.resample(frame):
+        st.session_state._asr_sr.send_audio(r_frame.to_ndarray().tobytes())
     return frame
 
-# --- 6. UI ---
+# --- 7. MAIN UI ---
 st.title("🪷 TBS Pro Translator")
 
-tab_v, tab_m = st.tabs(["🎙️ Voice Mode", "⌨️ Manual Mode"])
+tab_v, tab_m = st.tabs(["🎙️ Voice", "⌨️ Manual"])
 
 with tab_v:
     webrtc_ctx = webrtc_streamer(
@@ -121,65 +123,60 @@ with tab_v:
     )
 
 with tab_m:
-    m_input = st.text_area("Type Chinese:", placeholder="Paste text here...")
+    m_in = st.text_area("Type Chinese:", placeholder="Enter text...")
     if st.button("Translate Text"):
-        translate_logic(m_input)
+        threading.Thread(target=translate_callback_logic, args=(m_in,)).start()
 
-# CLEANUP: Graceful stop when mic is turned off
-if webrtc_ctx and not webrtc_ctx.state.playing and "sr" in st.session_state:
-    try:
-        st.session_state.sr.stop()
-    except:
-        pass
-    del st.session_state.sr
-
-st.divider()
-
-# --- 7. BILINGUAL PANELS ---
+# --- 8. UI REFRESH & BUFFER DRAIN ---
 c1, c2 = st.columns(2)
-
 with c1:
-    st.markdown("<div class='panel-header'>Source</div>", unsafe_allow_html=True)
-    src_p = st.empty() # Placeholder for live updates
-
+    st.markdown("<div class='panel-header'>Source</div>", 1)
+    src_p = st.empty()
 with c2:
-    st.markdown("<div class='panel-header'>Translation</div>", unsafe_allow_html=True)
-    tar_p = st.empty() # Placeholder for live updates
+    st.markdown("<div class='panel-header'>Translation</div>", 1)
+    tar_p = st.empty()
 
-# --- 8. THE REFRESH LOOP ---
-# Instead of st.rerun(), we update the placeholders. 
-# This prevents the 'NoneType' attribute crash.
+# The Heartbeat loop handles UI updates to avoid "Missing Context"
 while webrtc_ctx and webrtc_ctx.state.playing:
-    # Update Chinese Panel
-    src_html = "<div class='translation-card'>"
-    if st.session_state.live_cn:
-        src_html += f"<div class='text-display live-stream'>{st.session_state.live_cn}</div>"
-    for i in reversed(st.session_state.history):
-        src_html += f"<div class='text-display'>{i['cn']}</div><hr>"
-    src_p.markdown(src_html + "</div>", unsafe_allow_html=True)
-
-    # Update English Panel
-    tar_html = "<div class='translation-card'>"
-    for i in reversed(st.session_state.history):
-        tar_html += f"<div class='target-display'>{i['en']}</div>"
-        # Since we are in a loop, we use Markdown for the copyable text
-        tar_html += f"<code style='color:#757575'>{i['en']}</code><hr>"
-    tar_p.markdown(tar_html + "</div>", unsafe_allow_html=True)
+    # Drain CN Buffer for live view
+    while not st.session_state.cn_buf.empty():
+        st.session_state.live_cn = st.session_state.cn_buf.get()
     
-    time.sleep(0.5)
+    # Drain EN Buffer for history
+    while not st.session_state.en_buf.empty():
+        st.session_state.history.append(st.session_state.en_buf.get())
+        st.session_state.live_cn = ""
 
-# If not playing, show static history once
-if not webrtc_ctx or not webrtc_ctx.state.playing:
+    # Render panels
     src_html = "<div class='translation-card'>"
-    for i in reversed(st.session_state.history):
-        src_html += f"<div class='text-display'>{i['cn']}</div><hr>"
-    src_p.markdown(src_html + "</div>", unsafe_allow_html=True)
+    if st.session_state.live_cn: src_html += f"<div class='text-display live-stream'>{st.session_state.live_cn}</div>"
+    for i in reversed(st.session_state.history): src_html += f"<div class='text-display'>{i['cn']}</div><hr>"
+    src_p.markdown(src_html + "</div>", 1)
 
     tar_html = "<div class='translation-card'>"
     for i in reversed(st.session_state.history):
         tar_html += f"<div class='target-display'>{i['en']}</div>"
         tar_html += f"<code style='color:#757575'>{i['en']}</code><hr>"
-    tar_p.markdown(tar_html + "</div>", unsafe_allow_html=True)
+    tar_p.markdown(tar_html + "</div>", 1)
+    
+    time.sleep(0.3)
+
+# Static render when not playing
+if not webrtc_ctx or not webrtc_ctx.state.playing:
+    if hasattr(st.session_state, "_asr_sr"):
+        try: st.session_state._asr_sr.stop()
+        except: pass
+        del st.session_state._asr_sr
+
+    src_html = "<div class='translation-card'>"
+    for i in reversed(st.session_state.history): src_html += f"<div class='text-display'>{i['cn']}</div><hr>"
+    src_p.markdown(src_html + "</div>", 1)
+
+    tar_html = "<div class='translation-card'>"
+    for i in reversed(st.session_state.history):
+        tar_html += f"<div class='target-display'>{i['en']}</div>"
+        tar_html += f"<code style='color:#757575'>{i['en']}</code><hr>"
+    tar_p.markdown(tar_html + "</div>", 1)
 
 with st.sidebar:
     st.header("Settings")
