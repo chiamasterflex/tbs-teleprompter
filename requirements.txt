@@ -1,0 +1,12 @@
+streamlit
+streamlit-webrtc
+av
+aliyun-python-sdk-core
+nls
+openai
+langchain-community
+langchain-huggingface
+langchain-text-splitters
+faiss-cpu
+pypdf
+certifi
