@@ -2,7 +2,7 @@ streamlit
 streamlit-webrtc
 av
 aliyun-python-sdk-core
-nls
+git+https://github.com/aliyun/alibabacloud-nls-python-sdk.git
 openai
 langchain-community
 langchain-huggingface
